@@ -6,20 +6,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
+	"os/exec"
 	"strings"
 
 	"github.com/abiosoft/colima/cli"
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/config/configmanager"
-	"github.com/abiosoft/colima/util"
-	"github.com/sirupsen/logrus"
+	"github.com/abiosoft/colima/daemon/process/vmnet"
 )
 
-const (
-	LayerEnvVar = "COLIMA_LAYER_SSH_PORT"
-)
+// EnvLimaHome is the environment variable for the Lima directory.
+const EnvLimaHome = "LIMA_HOME"
+
+// LimactlCommand is the limactl command.
+const LimactlCommand = "limactl"
+
+// Limactl prepares a limactl command.
+func Limactl(args ...string) *exec.Cmd {
+	cmd := cli.Command(LimactlCommand, args...)
+	cmd.Env = append(cmd.Env, os.Environ()...)
+	cmd.Env = append(cmd.Env, EnvLimaHome+"="+LimaHome())
+	return cmd
+}
 
 // Instance returns current instance.
 func Instance() (InstanceInfo, error) {
@@ -41,8 +49,6 @@ func InstanceConfig() (config.Config, error) {
 //
 // TODO: unnecessary round-trip is done to get instance details from Lima.
 func IPAddress(profileID string) string {
-	// profile = toUserFriendlyName(profile)
-
 	const fallback = "127.0.0.1"
 	instance, err := getInstance(profileID)
 	if err != nil {
@@ -50,7 +56,11 @@ func IPAddress(profileID string) string {
 	}
 
 	if len(instance.Network) > 0 {
-		return getIPAddress(profileID, instance.Network[0].Interface)
+		for _, n := range instance.Network {
+			if n.Interface == vmnet.NetInterface {
+				return getIPAddress(profileID, n.Interface)
+			}
+		}
 	}
 
 	return fallback
@@ -81,84 +91,6 @@ func (i InstanceInfo) Config() (config.Config, error) {
 	return configmanager.LoadFrom(ColimaStateFile(i.Name))
 }
 
-// ShowSSH runs the show-ssh command in Lima.
-// returns the ssh output, if in layer, and an error if any
-func ShowSSH(profileID string, layer bool) (resp struct {
-	Output    string
-	IPAddress string
-	Layer     bool
-	File      struct {
-		Lima   string
-		Colima string
-	}
-}, err error) {
-	ssh := sshConfig(profileID)
-	sshConf, err := ssh.Contents()
-	if err != nil {
-		return resp, fmt.Errorf("error retrieving ssh config: %w", err)
-	}
-
-	ip := IPAddress(profileID)
-	var port int
-	if layer {
-		port, _ = ubuntuSSHPort(profileID)
-		// if layer is active and public IP is available, use the fixed port
-		if port > 0 && ip != "127.0.0.1" {
-			port = 23
-		}
-	} else {
-		ip = "127.0.0.1"
-	}
-
-	resp.Output = replaceSSHConfig(sshConf, profileID, ip, port)
-	resp.IPAddress = ip
-	resp.Layer = port > 0
-	resp.File.Lima = ssh.File()
-	resp.File.Colima = config.SSHConfigFile()
-	return resp, nil
-}
-
-func replaceSSHConfig(conf string, profileID string, ip string, port int) string {
-	profileID = config.Profile(profileID).ID
-	name := config.Profile(profileID).ShortName
-
-	var out bytes.Buffer
-	scanner := bufio.NewScanner(strings.NewReader(conf))
-
-	hasPrefix := func(line, s string) (pad string, ok bool) {
-		if s != "" && strings.HasPrefix(strings.TrimSpace(line), s) {
-			return line[:strings.Index(line, s[:1])], true
-		}
-		return "", false
-	}
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if strings.HasPrefix(line, "Host ") {
-			line = "Host " + profileID
-		}
-
-		if port > 0 {
-			if pad, ok := hasPrefix(line, "ControlPath "); ok {
-				configDir := filepath.Join(filepath.Dir(config.Dir()), name)
-				line = pad + "ControlPath " + strconv.Quote(filepath.Join(configDir, "ssh.sock"))
-			}
-
-			if pad, ok := hasPrefix(line, "Hostname "); ok {
-				line = pad + "Hostname " + ip
-			}
-
-			if pad, ok := hasPrefix(line, "Port"); ok {
-				line = pad + "Port " + strconv.Itoa(port)
-			}
-		}
-
-		_, _ = fmt.Fprintln(&out, line)
-	}
-	return out.String()
-}
-
 // Lima statuses
 const (
 	limaStatusRunning = "Running"
@@ -167,7 +99,7 @@ const (
 func getInstance(profileID string) (InstanceInfo, error) {
 	var i InstanceInfo
 	var buf bytes.Buffer
-	cmd := cli.Command("limactl", "list", profileID, "--json")
+	cmd := Limactl("list", profileID, "--json")
 	cmd.Stderr = nil
 	cmd.Stdout = &buf
 
@@ -194,7 +126,7 @@ func Instances(ids ...string) ([]InstanceInfo, error) {
 	args := append([]string{"list", "--json"}, limaIDs...)
 
 	var buf bytes.Buffer
-	cmd := cli.Command("limactl", args...)
+	cmd := Limactl(args...)
 	cmd.Stderr = nil
 	cmd.Stdout = &buf
 
@@ -217,8 +149,10 @@ func Instances(ids ...string) ([]InstanceInfo, error) {
 		}
 
 		if i.Running() {
-			if len(i.Network) > 0 && i.Network[0].Interface != "" {
-				i.IPAddress = getIPAddress(i.Name, i.Network[0].Interface)
+			for _, n := range i.Network {
+				if n.Interface == vmnet.NetInterface {
+					i.IPAddress = getIPAddress(i.Name, vmnet.NetInterface)
+				}
 			}
 			conf, _ := i.Config()
 			i.Runtime = getRuntime(conf)
@@ -238,31 +172,13 @@ func Instances(ids ...string) ([]InstanceInfo, error) {
 func getIPAddress(profileID, interfaceName string) string {
 	var buf bytes.Buffer
 	// TODO: this should be less hacky
-	cmd := cli.Command("limactl", "shell", profileID, "sh", "-c",
-		`ifconfig `+interfaceName+` | grep "inet addr:" | awk -F' ' '{print $2}' | awk -F':' '{print $2}'`)
+	cmd := Limactl("shell", profileID, "sh", "-c",
+		`ip -4 addr show `+interfaceName+` | grep inet | awk -F' ' '{print $2 }' | cut -d/ -f1`)
 	cmd.Stderr = nil
 	cmd.Stdout = &buf
 
 	_ = cmd.Run()
 	return strings.TrimSpace(buf.String())
-}
-
-func ubuntuSSHPort(profileID string) (int, error) {
-	var buf bytes.Buffer
-	cmd := cli.Command("limactl", "shell", profileID, "--", "sh", "-c", "echo $"+LayerEnvVar)
-	cmd.Stdout = &buf
-	cmd.Stderr = nil
-
-	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("cannot retrieve ubuntu layer SSH port: %w", err)
-	}
-
-	port, err := strconv.Atoi(strings.TrimSpace(buf.String()))
-	if err != nil {
-		return 0, fmt.Errorf("invalid ubuntu layer SSH port '%d': %w", port, err)
-	}
-
-	return port, nil
 }
 
 func getRuntime(conf config.Config) string {
@@ -281,78 +197,12 @@ func getRuntime(conf config.Config) string {
 	return runtime
 }
 
-var limaHome string
-
 // LimaHome returns the config directory for Lima.
 func LimaHome() string {
-	if limaHome != "" {
-		return limaHome
+	// if LIMA_HOME env var is set, obey it.
+	if dir := os.Getenv(EnvLimaHome); dir != "" {
+		return dir
 	}
 
-	home, err := func() (string, error) {
-		var buf bytes.Buffer
-		cmd := cli.Command("limactl", "info")
-		cmd.Stdout = &buf
-
-		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("error retrieving lima info: %w", err)
-		}
-
-		var resp struct {
-			LimaHome string `json:"limaHome"`
-		}
-		if err := json.NewDecoder(&buf).Decode(&resp); err != nil {
-			return "", fmt.Errorf("error decoding json for lima info: %w", err)
-		}
-		if resp.LimaHome == "" {
-			return "", fmt.Errorf("error retrieving lima info, ensure lima version is >0.7.4")
-		}
-
-		return resp.LimaHome, nil
-	}()
-
-	if err != nil {
-		err = fmt.Errorf("error detecting Lima config directory: %w", err)
-		logrus.Warnln(err)
-		logrus.Warnln("falling back to default '$HOME/.lima'")
-		home = filepath.Join(util.HomeDir(), ".lima")
-	}
-
-	limaHome = home
-	return home
-}
-
-const colimaStateFileName = "colima.yaml"
-
-// ColimaStateFile returns path to the colima state yaml file.
-func ColimaStateFile(profileID string) string {
-	return filepath.Join(LimaHome(), config.Profile(profileID).ID, colimaStateFileName)
-}
-
-const colimaDiffDisk = "diffdisk"
-
-// ColimaDiffDisk returns path to the diffdisk for the colima VM.
-func ColimaDiffDisk(profileID string) string {
-	return filepath.Join(LimaHome(), config.Profile(profileID).ID, colimaDiffDisk)
-}
-
-const sshConfigFile = "ssh.config"
-
-// sshConfig is the ssh configuration file for a Colima profile.
-type sshConfig string
-
-// Contents returns the content of the SSH config file.
-func (s sshConfig) Contents() (string, error) {
-	profile := config.Profile(string(s))
-	b, err := os.ReadFile(s.File())
-	if err != nil {
-		return "", fmt.Errorf("error retrieving Lima SSH config file for profile '%s': %w", strings.TrimPrefix(profile.DisplayName, "lima"), err)
-	}
-	return string(b), nil
-}
-
-// File returns the path to the SSH config file.
-func (s sshConfig) File() string {
-	profile := config.Profile(string(s))
-	return filepath.Join(LimaHome(), profile.ID, sshConfigFile)
+	return config.LimaDir()
 }

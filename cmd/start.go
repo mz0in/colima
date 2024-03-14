@@ -14,7 +14,7 @@ import (
 	"github.com/abiosoft/colima/cmd/root"
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/config/configmanager"
-	"github.com/abiosoft/colima/daemon/process/gvproxy"
+	"github.com/abiosoft/colima/core"
 	"github.com/abiosoft/colima/embedded"
 	"github.com/abiosoft/colima/environment"
 	"github.com/abiosoft/colima/environment/container/docker"
@@ -87,6 +87,11 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 		return start(app, conf)
 	},
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		// validate Lima version
+		if err := core.LimaVersionSupported(); err != nil {
+			return fmt.Errorf("lima compatibility error: %w", err)
+		}
+
 		// combine args and current config file(if any)
 		prepareConfig(cmd)
 
@@ -109,8 +114,6 @@ const (
 	defaultMemory            = 2
 	defaultDisk              = 60
 	defaultKubernetesVersion = kubernetes.DefaultVersion
-
-	defaultNetworkDriver = "gvproxy"
 
 	defaultVMType        = "qemu"
 	defaultMountTypeQEMU = "sshfs"
@@ -136,7 +139,6 @@ var startCmdArgs struct {
 
 func init() {
 	runtimes := strings.Join(environment.ContainerRuntimes(), ", ")
-	networkDrivers := strings.Join([]string{gvproxy.Name, "slirp"}, ", ")
 	defaultArch := string(environment.HostArch())
 
 	mounts := strings.Join([]string{defaultMountTypeQEMU, "9p", "virtiofs"}, ", ")
@@ -151,10 +153,10 @@ func init() {
 	startCmd.Flags().IntVarP(&startCmdArgs.Disk, "disk", "d", defaultDisk, "disk size in GiB")
 	startCmd.Flags().StringVarP(&startCmdArgs.Arch, "arch", "a", defaultArch, "architecture (aarch64, x86_64)")
 	startCmd.Flags().BoolVarP(&startCmdArgs.Flags.Foreground, "foreground", "f", false, "Keep colima in the foreground")
+	startCmd.Flags().StringVar(&startCmdArgs.Hostname, "hostname", "", "custom hostname for the virtual machine")
 
 	// network
 	if util.MacOS() {
-		startCmd.Flags().StringVar(&startCmdArgs.Network.Driver, "network-driver", defaultNetworkDriver, "network driver to use ("+networkDrivers+")")
 		startCmd.Flags().BoolVar(&startCmdArgs.Network.Address, "network-address", false, "assign reachable IP address to the VM")
 	}
 	if util.MacOS13OrNewer() {
@@ -171,7 +173,7 @@ func init() {
 	// mounts
 	startCmd.Flags().StringSliceVarP(&startCmdArgs.Flags.Mounts, "mount", "V", nil, "directories to mount, suffix ':w' for writable")
 	startCmd.Flags().StringVar(&startCmdArgs.MountType, "mount-type", defaultMountTypeQEMU, "volume driver for the mount ("+mounts+")")
-	startCmd.Flags().BoolVar(&startCmdArgs.MountINotify, "mount-inotify", false, "propagate inotify file events to the VM")
+	startCmd.Flags().BoolVar(&startCmdArgs.MountINotify, "mount-inotify", true, "propagate inotify file events to the VM")
 
 	// ssh agent
 	startCmd.Flags().BoolVarP(&startCmdArgs.ForwardAgent, "ssh-agent", "s", false, "forward SSH agent to the VM")
@@ -188,18 +190,12 @@ func init() {
 	startCmd.Flag("with-kubernetes").Hidden = true
 	startCmd.Flag("kubernetes-disable").Hidden = true
 
-	// layer
-	startCmd.Flags().BoolVarP(&startCmdArgs.Layer, "layer", "l", false, "enable Ubuntu container layer")
-
 	// env
 	startCmd.Flags().StringToStringVar(&startCmdArgs.Env, "env", nil, "environment variables for the VM")
 
 	// dns
 	startCmd.Flags().IPSliceVarP(&startCmdArgs.Network.DNSResolvers, "dns", "n", nil, "DNS resolvers for the VM")
 	startCmd.Flags().StringSliceVar(&startCmdArgs.Flags.DNSHosts, "dns-host", nil, "custom DNS names to provide to resolver")
-
-	// cgroups v2 workaround
-	startCmd.Flags().BoolVar(&startCmdArgs.TempCgroupsV2, "cgroups-v2", false, "cgroups v2 workaround for docker-compose")
 }
 
 func dnsHostsFromFlag(hosts []string) map[string]string {
@@ -247,8 +243,10 @@ func setDefaults(cmd *cobra.Command) {
 		startCmdArgs.VMType = defaultVMType
 	}
 
-	if startCmdArgs.Network.Driver == "" {
-		startCmdArgs.Network.Driver = defaultNetworkDriver
+	// m3 devices cannot use qemu
+	if util.M3() {
+		startCmdArgs.VMType = "vz"
+		cmd.Flag("vm-type").Changed = true
 	}
 
 	if util.MacOS13OrNewer() {
@@ -283,6 +281,10 @@ func setConfigDefaults(conf *config.Config) {
 	if conf.VMType == "" {
 		conf.VMType = defaultVMType
 	}
+	// m3 devices cannot use qemu
+	if util.M3() {
+		conf.VMType = "vz"
+	}
 
 	if conf.MountType == "" {
 		conf.MountType = defaultMountTypeQEMU
@@ -291,8 +293,8 @@ func setConfigDefaults(conf *config.Config) {
 		}
 	}
 
-	if conf.Network.Driver == "" {
-		conf.Network.Driver = defaultNetworkDriver
+	if conf.Hostname == "" {
+		conf.Hostname = config.CurrentProfile().ID
 	}
 }
 
@@ -395,22 +397,15 @@ func prepareConfig(cmd *cobra.Command) {
 	if !cmd.Flag("env").Changed {
 		startCmdArgs.Env = current.Env
 	}
-	if !cmd.Flag("layer").Changed {
-		startCmdArgs.Layer = current.Layer
+	if !cmd.Flag("hostname").Changed {
+		startCmdArgs.Hostname = current.Hostname
 	}
 	if !cmd.Flag("activate").Changed {
 		if current.ActivateRuntime != nil { // backward compatibility for `activate`
 			startCmdArgs.ActivateRuntime = current.ActivateRuntime
 		}
 	}
-	// cgroups v2 temp workaround
-	if !cmd.Flag("cgroups-v2").Changed {
-		startCmdArgs.TempCgroupsV2 = current.TempCgroupsV2
-	}
 	if util.MacOS() {
-		if !cmd.Flag("network-driver").Changed {
-			startCmdArgs.Network.Driver = current.Network.Driver
-		}
 		if !cmd.Flag("network-address").Changed {
 			startCmdArgs.Network.Address = current.Network.Address
 		}

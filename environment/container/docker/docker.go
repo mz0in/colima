@@ -45,8 +45,11 @@ func (d dockerRuntime) Provision(ctx context.Context) error {
 
 	// daemon.json
 	a.Add(func() error {
-		// not a fatal error
-		if err := d.createDaemonFile(conf.Docker); err != nil {
+		// these are not fatal errors
+		if err := d.createDaemonFile(conf.Docker, conf.Env); err != nil {
+			log.Warnln(err)
+		}
+		if err := d.addHostGateway(conf.Docker); err != nil {
 			log.Warnln(err)
 		}
 		return nil
@@ -64,13 +67,25 @@ func (d dockerRuntime) Provision(ctx context.Context) error {
 func (d dockerRuntime) Start(ctx context.Context) error {
 	a := d.Init(ctx)
 
-	a.Add(func() error {
-		return d.guest.Run("sudo", "service", "docker", "start")
+	// TODO: interval is high due to 0.6.3->0.6.4 docker-ce package transition
+	//       to ensure startup is successful
+	a.Retry("", time.Second, 120, func(int) error {
+		return d.guest.RunQuiet("sudo", "service", "docker", "start")
 	})
 
-	// service startup takes few seconds, retry at most 5 times before giving up.
-	a.Retry("", time.Second*5, 12, func(int) error {
+	// service startup takes few seconds, retry for a minute before giving up.
+	a.Retry("", time.Second, 60, func(int) error {
 		return d.guest.RunQuiet("sudo", "docker", "info")
+	})
+
+	// ensure docker is accessible without root
+	// otherwise, restart to ensure user is added to docker group
+	a.Add(func() error {
+		if err := d.guest.RunQuiet("docker", "info"); err == nil {
+			return nil
+		}
+		ctx := context.WithValue(ctx, cli.CtxKeyQuiet, true)
+		return d.guest.Restart(ctx)
 	})
 
 	return a.Exec()

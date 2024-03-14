@@ -6,18 +6,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/abiosoft/colima/daemon"
-	"github.com/abiosoft/colima/daemon/process/gvproxy"
 	"github.com/abiosoft/colima/daemon/process/vmnet"
 
 	"github.com/abiosoft/colima/config"
-	"github.com/abiosoft/colima/embedded"
 	"github.com/abiosoft/colima/environment"
 	"github.com/abiosoft/colima/environment/container/docker"
-	"github.com/abiosoft/colima/environment/vm/lima/limautil"
 	"github.com/abiosoft/colima/util"
 	"github.com/sirupsen/logrus"
 )
@@ -53,8 +49,16 @@ func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
 	}
 
 	l.Images = append(l.Images,
-		File{Arch: environment.AARCH64, Location: "https://github.com/abiosoft/alpine-lima/releases/download/colima-v0.5.6/alpine-lima-clm-3.18.3-aarch64.iso", Digest: "sha512:376cc8cb777380757dbcdb87825f076c25e97283dfef8d51f025fae8bad6953462d095187643a5f7a9be35b86687e0f5b654758fc55ded67aa390f657e0b59b3"},
-		File{Arch: environment.X8664, Location: "https://github.com/abiosoft/alpine-lima/releases/download/colima-v0.5.6/alpine-lima-clm-3.18.3-x86_64.iso", Digest: "sha512:48bf6c7468fc8acc05d14b3b138958cf4417fa26e478d864c8458a0c7aa8e9742c19058f792debc7585614e0a4ba6ad9608c2e6ff695a2d7ae8daafb8ad64db2"},
+		File{
+			Arch:     environment.AARCH64,
+			Location: "https://github.com/abiosoft/colima-core/releases/download/v0.6.8-2/ubuntu-23.10-minimal-cloudimg-arm64.qcow2",
+			Digest:   "sha512:00e3339bdebd98c3e003570ffb3ad4b01630fe4fcecd15061d5d58e14c07b211c718ed20fa3e4cce227d3b1c59fd98241eaa3e9e2cdfa04acfe32b4bc385428c",
+		},
+		File{
+			Arch:     environment.X8664,
+			Location: "https://github.com/abiosoft/colima-core/releases/download/v0.6.8-2/ubuntu-23.10-minimal-cloudimg-amd64.qcow2",
+			Digest:   "sha512:97a6df4d4f4d13267fc7989933da537071513b3175a5785728992a8a198e0ceaaa0eaa2a9a4b01beaf6b998cc20b5995dc701e5c6d9ba2f4308e4208a84215df",
+		},
 	)
 
 	if conf.CPU > 0 {
@@ -79,19 +83,6 @@ func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
 	if _, ok := l.HostResolver.Hosts["host.docker.internal"]; !ok {
 		l.HostResolver.Hosts["host.docker.internal"] = "host.lima.internal"
 	}
-	if len(l.DNS) == 0 {
-		gvProxyEnabled, _ := ctx.Value(daemon.CtxKey(gvproxy.Name)).(bool)
-		if gvProxyEnabled {
-			l.DNS = append(l.DNS, net.ParseIP(gvproxy.GatewayIP))
-			l.HostResolver.Enabled = false
-		}
-		reachableIPAddress, _ := ctx.Value(daemon.CtxKey(vmnet.Name)).(bool)
-		if reachableIPAddress {
-			if gvProxyEnabled {
-				l.DNS = append(l.DNS, net.ParseIP(vmnet.NetGateway))
-			}
-		}
-	}
 
 	l.Env = conf.Env
 	if l.Env == nil {
@@ -109,47 +100,28 @@ func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
 		// add user to docker group
 		// "sudo", "usermod", "-aG", "docker", user
 		l.Provision = append(l.Provision, Provision{
-			Mode:   ProvisionModeUser,
-			Script: "sudo usermod -aG docker $USER",
+			Mode:   ProvisionModeDependency,
+			Script: "groupadd -f docker && usermod -aG docker {{ .User }}",
 		})
 
-		// allow env vars propagation for services
+		// set hostname
+		hostname := config.CurrentProfile().ID
+		if conf.Hostname != "" {
+			hostname = conf.Hostname
+		}
 		l.Provision = append(l.Provision, Provision{
 			Mode:   ProvisionModeSystem,
-			Script: `grep -q "^rc_env_allow" /etc/rc.conf || echo 'rc_env_allow="*"' >> /etc/rc.conf`,
+			Script: "hostnamectl set-hostname " + hostname,
 		})
 
-		// cgroups v2 workaround
-		{
-			// delete setting if present
-			l.Provision = append(l.Provision, Provision{
-				Mode:   ProvisionModeSystem,
-				Script: `(grep -q "^rc_cgroup_mode" /etc/rc.conf && sed -i '/^rc_cgroup_mode/d' /etc/rc.conf && service cgroups restart) || echo 'cgroup v2 config not found'`,
-			})
-
-			// validate workaround is supported
-			if conf.TempCgroupsV2 {
-				if conf.Kubernetes.Enabled {
-					logrus.Warnln("cgroups v2 workaround not compatible with Kubernetes, ignoring...")
-					conf.TempCgroupsV2 = false
-				}
-				if conf.Layer {
-					logrus.Warnln("cgroups v2 workaround not compatible with Ubuntu layer, ignoring...")
-					conf.TempCgroupsV2 = false
-				}
-			}
-
-			if conf.TempCgroupsV2 {
-				l.Provision = append(l.Provision, Provision{
-					Mode:   ProvisionModeSystem,
-					Script: `echo 'rc_cgroup_mode="unified"' >> /etc/rc.conf && service cgroups restart`,
-				})
-			}
-		}
 	}
 
 	// network setup
 	{
+		l.Networks = append(l.Networks, Network{
+			Lima: "user-v2",
+		})
+
 		reachableIPAddress := true
 		if conf.Network.Address {
 			if l.VMType == VZ {
@@ -203,71 +175,6 @@ func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
 				)
 			}
 		}
-
-		// gvproxy is cross-platform but not needed on Linux as slirp is only erratic on macOS.
-		gvProxyEnabled, _ := ctx.Value(daemon.CtxKey(gvproxy.Name)).(bool)
-		if gvProxyEnabled && util.MacOS() {
-			var values struct {
-				Vmnet struct {
-					Enabled   bool
-					Interface string
-				}
-				GVProxy struct {
-					Enabled    bool
-					MacAddress string
-					IPAddress  net.IP
-					Gateway    net.IP
-				}
-			}
-
-			if reachableIPAddress {
-				values.Vmnet.Enabled = true
-				values.Vmnet.Interface = vmnet.NetInterface
-			}
-
-			gvProxyEnabled, _ := ctx.Value(daemon.CtxKey(gvproxy.Name)).(bool)
-			if gvProxyEnabled {
-				values.GVProxy.Enabled = true
-				values.GVProxy.MacAddress = strings.ToUpper(gvproxy.MacAddress())
-				values.GVProxy.IPAddress = net.ParseIP(gvproxy.DeviceIP)
-				values.GVProxy.Gateway = net.ParseIP(gvproxy.GatewayIP)
-
-				if err := func() error {
-					tpl, err := embedded.ReadString("network/ifaces.sh")
-					if err != nil {
-						return err
-					}
-
-					script, err := util.ParseTemplate(tpl, values)
-					if err != nil {
-						return fmt.Errorf("error parsing template for network script: %w", err)
-					}
-
-					l.Provision = append(l.Provision, Provision{
-						Mode:   ProvisionModeSystem,
-						Script: string(script),
-					})
-
-					return nil
-				}(); err != nil {
-					logrus.Warn(fmt.Errorf("error setting up gvproxy network: %w", err))
-				}
-			}
-		}
-	}
-
-	// port forwarding
-
-	if conf.Layer {
-		port := util.RandomAvailablePort()
-		// set port for future retrieval
-		l.Env[limautil.LayerEnvVar] = strconv.Itoa(port)
-		// forward port
-		l.PortForwards = append(l.PortForwards,
-			PortForward{
-				GuestPort: 23,
-				HostPort:  port,
-			})
 	}
 
 	// ports and sockets
@@ -326,25 +233,25 @@ func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
 		}
 	}
 
+	// Ubuntu minimal cloud image does not bundle sshfs
+	// if sshfs is used, add as a dependency
+	if l.MountType == REVSSHFS {
+		l.Provision = append(l.Provision, Provision{
+			Mode:   ProvisionModeDependency,
+			Script: `which sshfs || apt install -y sshfs`,
+		})
+	}
+
 	l.Provision = append(l.Provision, Provision{
 		Mode:   ProvisionModeSystem,
-		Script: "mkmntdirs && mount -a",
+		Script: "mount -a",
 	})
 
 	// trim mounted drive to recover disk space
 	l.Provision = append(l.Provision, Provision{
 		Mode:   ProvisionModeSystem,
-		Script: `readlink /sbin/fstrim || fstrim -a`,
+		Script: `readlink /usr/sbin/fstrim || fstrim -a`,
 	})
-
-	// workaround for slow virtiofs https://github.com/drud/ddev/issues/4466#issuecomment-1361261185
-	// TODO: remove when fixed upstream
-	if l.MountType == VIRTIOFS {
-		l.Provision = append(l.Provision, Provision{
-			Mode:   ProvisionModeSystem,
-			Script: `stat /sys/class/block/vda/queue/write_cache && echo 'write through' > /sys/class/block/vda/queue/write_cache`,
-		})
-	}
 
 	if len(conf.Mounts) == 0 {
 		l.Mounts = append(l.Mounts,
@@ -507,13 +414,16 @@ type Network struct {
 type ProvisionMode = string
 
 const (
-	ProvisionModeSystem ProvisionMode = "system"
-	ProvisionModeUser   ProvisionMode = "user"
+	ProvisionModeSystem     ProvisionMode = "system"
+	ProvisionModeUser       ProvisionMode = "user"
+	ProvisionModeBoot       ProvisionMode = "boot"
+	ProvisionModeDependency ProvisionMode = "dependency"
 )
 
 type Provision struct {
-	Mode   ProvisionMode `yaml:"mode" json:"mode"` // default: "system"
-	Script string        `yaml:"script" json:"script"`
+	Mode           ProvisionMode `yaml:"mode" json:"mode"` // default: "system"
+	Script         string        `yaml:"script" json:"script"`
+	SkipResolution bool          `yaml:"skipDefaultDependencyResolution,omitempty" json:"skipDefaultDependencyResolution,omitempty"`
 }
 
 type NineP struct {

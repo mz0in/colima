@@ -42,7 +42,7 @@ brew install --HEAD colima
 
 ### Upgrading
 
-If upgrading from v0.4.6 or lower, it is required to start afresh by deleting existing instance.
+If upgrading from v0.5.6 or lower, it is required to start afresh by deleting existing instance.
 
 ```sh
 colima delete # delete existing instance
@@ -144,6 +144,10 @@ Colima means Containers in [Lima](https://github.com/lima-vm/lima).
 
 Since Lima is aka Linux on Mac. By transitivity, Colima can also mean Containers on Linux on Mac.
 
+## And the Logo?
+
+The logo was contributed by [Daniel Hodvogner](https://github.com/dhodvogner). Check [this issue](https://github.com/abiosoft/colima/issues/781) for more.
+
 ## Troubleshooting and FAQs
 
 Check [here](docs/FAQ.md) for Frequently Asked Questions.
@@ -158,7 +162,6 @@ Check [here](docs/FAQ.md) for Frequently Asked Questions.
 ## Help Wanted
 
 - Documentation (wiki pages)
-- Project Logo
 
 ## License
 
